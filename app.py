@@ -145,12 +145,32 @@ mode = st.radio(
 pool = neutral.copy() if mode == "Neutral atoms" else ions.copy()
 
 if mode == "Ions":
-    # Prefer records marked most reliable, but only within
-    # identical species, coordination, and spin groups.
-    group_cols = ["species", "coordination", "spin"]
-    preferred_parts = []
+    # Select coordination first, preserving the source records.
+    coord_values = sorted(
+        c for c in pool["coordination"].unique()
+        if c and c.lower() != "nan"
+    )
 
-    for _, group in pool.groupby(group_cols, dropna=False):
+    if not coord_values:
+        st.error("No coordination values are available.")
+        st.stop()
+
+    coordination = st.selectbox(
+        "Coordination environment",
+        coord_values,
+        index=coord_values.index("VI")
+        if "VI" in coord_values else 0
+    )
+
+    pool = pool[
+        pool["coordination"] == coordination
+    ].copy()
+
+    # Prefer reliable records for each ion, where available.
+    # Keep distinct spin states separate if they are meaningful.
+    selected_rows = []
+
+    for species, group in pool.groupby("species"):
         reliable = pd.to_numeric(
             group["most_reliable"], errors="coerce"
         ).fillna(0)
@@ -158,44 +178,24 @@ if mode == "Ions":
         if (reliable == 1).any():
             group = group[reliable == 1]
 
-        preferred_parts.append(group)
+        # If duplicate records remain, use one only when
+        # the ionic radius values agree.
+        if group["radius_pm"].nunique() == 1:
+            selected_rows.append(group.iloc[0])
+        else:
+            # Do not arbitrarily choose between conflicting
+            # radii for the same ion.
+            continue
 
-    pool = pd.concat(preferred_parts, ignore_index=True)
+    if selected_rows:
+        pool = pd.DataFrame(selected_rows).reset_index(drop=True)
+    else:
+        pool = pool.iloc[0:0].copy()
 
-    coord_values = sorted(
-        c for c in pool["coordination"].unique() if c
-    )
-
-    if coord_values:
-        coordination = st.selectbox(
-            "Coordination environment",
-            coord_values,
-            help=(
-                "For scientifically meaningful comparisons, "
-                "compare ions using the same coordination environment."
-            )
-        )
-        pool = pool[pool["coordination"] == coordination]
-
-    # Multiple spin records can remain. Avoid arbitrary choices.
-    spin_values = sorted(
-        s for s in pool["spin"].unique() if s
-    )
-
-    if spin_values:
-        spin = st.selectbox(
-            "Spin state",
-            ["All spin states"] + spin_values
-        )
-        if spin != "All spin states":
-            pool = pool[pool["spin"] == spin]
-
-    counts = pool["species"].value_counts()
-    options = sorted(counts[counts == 1].index.tolist())
+    options = sorted(pool["species"].unique().tolist())
 
 else:
     options = sorted(pool["species"].unique().tolist())
-
 if len(options) < 4:
     st.warning(
         f"Only {len(options)} unambiguous species are available "
