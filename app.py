@@ -10,8 +10,8 @@ st.set_page_config(
 
 st.title("⚛️ Atomic Size Predictor")
 st.write(
-    "Compare and arrange four atoms or ions using "
-    "reference radius data."
+    "Compare and arrange four elements or ions "
+    "using reference atomic and ionic radii."
 )
 
 BASE = Path(__file__).parent
@@ -20,97 +20,119 @@ IONIC_FILE = BASE / "ionic_radii.csv"
 
 
 @st.cache_data
-def load_csv(path):
-    df = pd.read_csv(path)
+def load_csv(filename):
+    return pd.read_csv(filename)
+
+
+def ion_label(symbol, charge):
+    charge = int(charge)
+    if charge == 0:
+        return symbol
+    if charge == 1:
+        return f"{symbol}+"
+    if charge == -1:
+        return f"{symbol}-"
+    return f"{symbol}{abs(charge)}{'+' if charge > 0 else '-'}"
+
+
+def load_neutral():
+    df = load_csv(str(ATOMIC_FILE))
     df.columns = df.columns.str.strip()
-    return df
 
-
-def find_column(df, possible_names):
-    """Find a column despite capitalization or spacing differences."""
-    normalized = {
-        str(c).strip().lower().replace(" ", "_"): c
-        for c in df.columns
-    }
-
-    for name in possible_names:
-        key = name.lower().replace(" ", "_")
-        if key in normalized:
-            return normalized[key]
-
-    return None
-
-
-def prepare_data(df, is_ion):
-    symbol_col = find_column(
-        df, ["species", "symbol", "ion", "element"]
+    # Adapt to the common neutral-radius dataset columns
+    symbol_col = "symbol" if "symbol" in df.columns else "Symbol"
+    radius_col = next(
+        (c for c in ["radius_pm", "atomic_radius",
+                     "atomic_radius_pm", "covalent_radius"]
+         if c in df.columns),
+        None
     )
-    radius_col = find_column(
-        df, ["radius_pm", "atomic_radius", "ionic_radius",
-             "radius", "calculated_radius"]
-    )
-    charge_col = find_column(
-        df, ["charge", "ionic_charge"]
-    )
-    coord_col = find_column(
-        df, ["coordination", "coordination_number"]
-    )
-    spin_col = find_column(df, ["spin", "spin_state"])
 
-    if symbol_col is None or radius_col is None:
+    if radius_col is None or symbol_col not in df.columns:
         raise ValueError(
-            "Could not identify the species and radius columns. "
-            f"Columns found: {list(df.columns)}"
+            f"Neutral CSV columns are {df.columns.tolist()}. "
+            "Please check its symbol and radius column names."
         )
 
-    out = pd.DataFrame()
-    out["species"] = df[symbol_col].astype(str).str.strip()
-    out["radius_pm"] = pd.to_numeric(
-        df[radius_col], errors="coerce"
+    out = pd.DataFrame({
+        "species": df[symbol_col].astype(str).str.strip(),
+        "radius_pm": pd.to_numeric(
+            df[radius_col], errors="coerce"
+        ),
+        "charge": 0,
+        "radius_type": "neutral",
+        "coordination": "",
+        "spin": ""
+    })
+
+    return out.dropna(subset=["radius_pm"])
+
+
+def load_ions():
+    df = load_csv(str(IONIC_FILE))
+    df.columns = df.columns.str.strip()
+
+    required = [
+        "symbol", "charge", "coordination", "ionic_radius"
+    ]
+    missing = [c for c in required if c not in df.columns]
+
+    if missing:
+        raise ValueError(
+            "Ionic CSV is missing: " + ", ".join(missing)
+        )
+
+    df["charge"] = pd.to_numeric(df["charge"], errors="coerce")
+    df["ionic_radius"] = pd.to_numeric(
+        df["ionic_radius"], errors="coerce"
     )
 
-    if charge_col is not None:
-        out["charge"] = pd.to_numeric(
-            df[charge_col], errors="coerce"
-        )
+    df = df.dropna(
+        subset=["symbol", "charge", "ionic_radius"]
+    ).copy()
+
+    df = df[df["charge"] != 0]
+
+    df["species"] = df.apply(
+        lambda r: ion_label(r["symbol"], r["charge"]),
+        axis=1
+    )
+
+    out = pd.DataFrame({
+        "species": df["species"],
+        "radius_pm": df["ionic_radius"],
+        "charge": df["charge"],
+        "radius_type": "ionic",
+        "coordination": df["coordination"].fillna("").astype(str),
+        "spin": (
+            df["spin"].fillna("").astype(str)
+            if "spin" in df.columns else ""
+        ),
+        "symbol": df["symbol"]
+    })
+
+    # Prefer reliable records when they exist for the same
+    # species/coordination/spin combination.
+    if "most_reliable" in df.columns:
+        out["most_reliable"] = df["most_reliable"].values
     else:
-        out["charge"] = pd.NA if is_ion else 0
-
-    out["radius_type"] = "ionic" if is_ion else "neutral"
-
-    out["coordination"] = (
-        df[coord_col].fillna("").astype(str).str.strip()
-        if coord_col else ""
-    )
-    out["spin"] = (
-        df[spin_col].fillna("").astype(str).str.strip()
-        if spin_col else ""
-    )
-
-    out = out.dropna(subset=["radius_pm"]).copy()
-
-    # Do not silently treat missing ionic charges as zero.
-    if is_ion:
-        out = out.dropna(subset=["charge"])
-        out = out[out["charge"] != 0]
+        out["most_reliable"] = 0
 
     return out
 
 
-for path in [ATOMIC_FILE, IONIC_FILE]:
-    if not path.exists():
-        st.error(f"File not found: {path.name}")
-        st.stop()
+if not ATOMIC_FILE.exists() or not IONIC_FILE.exists():
+    st.error(
+        "Upload neutral_atomic_radii.csv and ionic_radii.csv "
+        "to the same GitHub repository as app.py."
+    )
+    st.stop()
 
 try:
-    neutral = prepare_data(
-        load_csv(str(ATOMIC_FILE)), is_ion=False
-    )
-    ions = prepare_data(
-        load_csv(str(IONIC_FILE)), is_ion=True
-    )
+    neutral = load_neutral()
+    ions = load_ions()
 except Exception as exc:
-    st.error(f"Could not prepare your data: {exc}")
+    st.error(f"Dataset loading error: {exc}")
     st.stop()
 
 
@@ -123,32 +145,62 @@ mode = st.radio(
 pool = neutral.copy() if mode == "Neutral atoms" else ions.copy()
 
 if mode == "Ions":
-    coordination_values = sorted(
+    # Prefer records marked most reliable, but only within
+    # identical species, coordination, and spin groups.
+    group_cols = ["species", "coordination", "spin"]
+    preferred_parts = []
+
+    for _, group in pool.groupby(group_cols, dropna=False):
+        reliable = pd.to_numeric(
+            group["most_reliable"], errors="coerce"
+        ).fillna(0)
+
+        if (reliable == 1).any():
+            group = group[reliable == 1]
+
+        preferred_parts.append(group)
+
+    pool = pd.concat(preferred_parts, ignore_index=True)
+
+    coord_values = sorted(
         c for c in pool["coordination"].unique() if c
     )
 
-    if coordination_values:
+    if coord_values:
         coordination = st.selectbox(
             "Coordination environment",
-            coordination_values
+            coord_values,
+            help=(
+                "For scientifically meaningful comparisons, "
+                "compare ions using the same coordination environment."
+            )
         )
         pool = pool[pool["coordination"] == coordination]
-    else:
-        st.warning(
-            "Your ionic file has no coordination information. "
-            "Comparisons will be limited to its available records."
-        )
 
-    # Multiple records may exist for the same ion.
+    # Multiple spin records can remain. Avoid arbitrary choices.
+    spin_values = sorted(
+        s for s in pool["spin"].unique() if s
+    )
+
+    if spin_values:
+        spin = st.selectbox(
+            "Spin state",
+            ["All spin states"] + spin_values
+        )
+        if spin != "All spin states":
+            pool = pool[pool["spin"] == spin]
+
     counts = pool["species"].value_counts()
     options = sorted(counts[counts == 1].index.tolist())
+
 else:
     options = sorted(pool["species"].unique().tolist())
 
 if len(options) < 4:
-    st.error(
-        "Fewer than four unambiguous species are available "
-        "for this selection. Check your CSV columns and data."
+    st.warning(
+        f"Only {len(options)} unambiguous species are available "
+        "with the current settings. Try another coordination "
+        "environment or inspect the CSV data."
     )
     st.stop()
 
@@ -179,15 +231,15 @@ direction = st.radio(
 
 if st.button("Sort species", type="primary"):
     if len(set(selected)) != 4:
-        st.error("Please choose four different species.")
+        st.error("Please select four different species.")
         st.stop()
 
     result = pool[pool["species"].isin(selected)].copy()
 
     if result["species"].duplicated().any():
         st.error(
-            "Some species have multiple reference records. "
-            "Select a specific coordination or spin state."
+            "Some species still have multiple radius records. "
+            "Select a more specific coordination or spin state."
         )
         st.stop()
 
@@ -198,12 +250,14 @@ if st.button("Sort species", type="primary"):
 
     result.insert(0, "Rank", range(1, len(result) + 1))
 
-    st.subheader("Results")
+    st.subheader("Ranking results")
     st.dataframe(
-        result.rename(columns={
+        result[
+            ["Rank", "species", "radius_pm", "charge",
+             "coordination", "spin"]
+        ].rename(columns={
             "species": "Species",
-            "radius_pm": "Radius (pm)",
-            "radius_type": "Radius type",
+            "radius_pm": "Ionic/atomic radius (pm)",
             "charge": "Charge",
             "coordination": "Coordination",
             "spin": "Spin state"
@@ -218,13 +272,13 @@ if st.button("Sort species", type="primary"):
     )
 
     st.caption(
-        "Rankings use the reference radii in your CSV files, "
-        "not ML predictions. Check the source and radius "
-        "definition before comparing values."
+        "Ranks use reference values from the selected dataset. "
+        "Ionic radii depend on coordination and can also depend "
+        "on spin state."
     )
 
-with st.expander("Inspect loaded data"):
-    st.write("Neutral atom records:", len(neutral))
+with st.expander("Inspect available records"):
+    st.write("Neutral radius records:", len(neutral))
     st.dataframe(neutral.head(20))
-    st.write("Ionic records:", len(ions))
+    st.write("Ionic radius records:", len(ions))
     st.dataframe(ions.head(20))
